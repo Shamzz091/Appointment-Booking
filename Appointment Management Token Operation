@@ -1,0 +1,16 @@
+-- paste your token between the quotes
+select length('PASTE_TOKEN') len, 'PASTE_TOKEN' ~ '^[0-9a-f]+$' as is_hex;
+
+select id, status, manage_token_expires_at
+from public.appointments
+where manage_token = 'PASTE_TOKEN';
+
+-- Generate tokens for existing confirmed/reconfirm_pending appointments missing a token
+update public.appointments
+set manage_token = public._gen_manage_token(),
+    manage_token_expires_at = now() + interval '365 days'
+where status in ('confirmed','reconfirm_pending')
+  and manage_token is null;
+
+
+

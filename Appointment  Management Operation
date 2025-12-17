@@ -1,0 +1,12 @@
+-- Confirm something and check token exists
+select id, status, manage_token from public.appointments
+order by created_at desc limit 3;
+
+-- Fetch by token
+select * from public.get_appointment_by_token('<TOKEN>');
+
+-- Reschedule
+select public.reschedule_appointment_by_token('<TOKEN>', now() + interval '3 days 15 hours');
+
+-- Cancel
+select public.cancel_appointment_by_token('<TOKEN>', 'Client can’t make it');

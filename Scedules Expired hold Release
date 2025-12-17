@@ -1,0 +1,9 @@
+-- enable pg_cron (project-level; safe to re-run)
+create extension if not exists pg_cron;
+
+-- run every 5 minutes
+select cron.schedule(
+  'release_expired_holds_job',
+  '*/5 * * * *',
+  $$select public.release_expired_holds();$$
+);

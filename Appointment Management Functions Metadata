@@ -1,0 +1,10 @@
+select routine_name, data_type, type_udt_name as returns
+from information_schema.routines
+where specific_schema='public'
+  and routine_name in (
+    'get_appointment_by_token',
+    'reschedule_appointment_by_token',
+    'cancel_appointment_by_token',
+    'issue_manage_token'
+  )
+order by routine_name;

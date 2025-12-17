@@ -1,0 +1,36 @@
+create or replace function public.confirm_booking_debug(p_appointment_id uuid)
+returns text
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare
+  v_exists boolean;
+  v_pending boolean;
+  v_notexpired boolean;
+  v_rows int;
+begin
+  -- does it exist?
+  select exists(select 1 from appointments where id=p_appointment_id) into v_exists;
+  if not v_exists then return 'not_found'; end if;
+
+  -- is it pending?
+  select (status='pending') from appointments where id=p_appointment_id into v_pending;
+  if not v_pending then return 'not_pending'; end if;
+
+  -- is the hold still valid?
+  select (hold_expires_at is null or hold_expires_at > now()) from appointments
+   where id=p_appointment_id into v_notexpired;
+  if not v_notexpired then return 'hold_expired'; end if;
+
+  -- try to confirm
+  update appointments
+     set status='confirmed', hold_expires_at=null
+   where id=p_appointment_id and status='pending'
+     and (hold_expires_at is null or hold_expires_at>now());
+  get diagnostics v_rows = row_count;
+
+  if v_rows=1 then return 'ok'; else return 'unknown'; end if;
+end; $$;
+
+grant execute on function public.confirm_booking_debug(uuid) to anon, authenticated;

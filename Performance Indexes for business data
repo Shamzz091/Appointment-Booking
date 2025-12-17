@@ -1,0 +1,5 @@
+-- common filters
+create index if not exists leads_biz_status_idx on leads (business_id, status);
+create index if not exists leads_biz_category_score_idx on leads (business_id, category, score desc);
+create index if not exists waitlist_biz_service_idx on waitlist (business_id, service_id, priority_score desc);
+create index if not exists appt_biz_status_start_idx on appointments (business_id, status, start_ts);

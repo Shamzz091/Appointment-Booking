@@ -1,0 +1,73 @@
+-- unique index for upsert
+create unique index if not exists staff_working_hours_uniq
+on public.staff_working_hours (business_id, staff_id, day_of_week);
+
+create or replace function public.set_staff_working_hours(
+  p_staff_id uuid,
+  p_week jsonb  -- [{"dow":1,"start":"09:00","end":"17:00"}, ...]
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_bid uuid;
+  v_rows_upsert int := 0;
+  v_rows_delete int := 0;
+begin
+  perform set_safe_search_path();
+
+  -- verify staff belongs to caller's business
+  select s.business_id into v_bid
+  from public.staff s
+  where s.id = p_staff_id
+    and s.business_id in (select business_id from public.get_user_businesses())
+  limit 1;
+  if v_bid is null then
+    raise exception 'Staff not found or not in your business';
+  end if;
+
+  -- normalize input
+  with input_rows as (
+    select
+      v_bid                       as business_id,
+      p_staff_id                  as staff_id,
+      (x->>'dow')::int            as day_of_week,
+      (x->>'start')::time         as start_local,
+      (x->>'end')::time           as end_local
+    from jsonb_array_elements(coalesce(p_week, '[]'::jsonb)) as x
+  ), valid_rows as (
+    select *
+    from input_rows
+    where day_of_week between 0 and 6
+      and start_local is not null
+      and end_local   is not null
+      and end_local   > start_local
+  )
+  insert into public.staff_working_hours (business_id, staff_id, day_of_week, start_local, end_local)
+  select business_id, staff_id, day_of_week, start_local, end_local
+  from valid_rows
+  on conflict (business_id, staff_id, day_of_week)
+  do update set
+    start_local = excluded.start_local,
+    end_local   = excluded.end_local;
+  get diagnostics v_rows_upsert = row_count;
+
+  -- delete only rows not present in payload (scoped)
+  with payload_days as (
+    select (x->>'dow')::int as day_of_week
+    from jsonb_array_elements(coalesce(p_week, '[]'::jsonb)) as x
+    where (x->>'dow') ~ '^[0-6]$'
+  )
+  delete from public.staff_working_hours wh
+  where wh.business_id = v_bid
+    and wh.staff_id = p_staff_id
+    and not exists (select 1 from payload_days d where d.day_of_week = wh.day_of_week);
+  get diagnostics v_rows_delete = row_count;
+
+  return true;
+end $$;
+
+revoke all on function public.set_staff_working_hours(uuid, jsonb) from public;
+grant execute on function public.set_staff_working_hours(uuid, jsonb) to authenticated;

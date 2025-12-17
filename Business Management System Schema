@@ -1,0 +1,269 @@
+-- A) Extensions (safe if they already exist)
+create extension if not exists pgcrypto;
+create extension if not exists btree_gist;
+
+-- B) Enums
+do $$ begin
+  create type lead_source as enum ('call','web','ads','maps','csv');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type lead_category as enum (
+    'cold','warming','warm',
+    'abandoned_booking','cancelled_return','no_show_return',
+    'info_seeker','pricing_inquiry','missed_call'
+  );
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type lead_status as enum ('open','nurturing','converted','snoozed','opted_out');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type activity_type as enum ('inbound_call','outbound_call','sms','email','webview','note');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type sentiment as enum ('negative','neutral','positive');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type appointment_status as enum ('pending','confirmed','reconfirm_pending','cancelled','completed','no_show','conflict_pending');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type appointment_origin as enum ('web','call_agent','staff','api');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type comm_channel as enum ('sms','email','voice');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type comm_status as enum ('queued','sent','delivered','failed');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type related_type as enum ('lead','appointment');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type user_role as enum ('owner','manager','staff');
+exception when duplicate_object then null; end $$;
+
+-- C) Core tenancy
+create table if not exists businesses (
+  id uuid primary key default gen_random_uuid(),
+  slug text unique not null,                  -- used by public widget
+  name text not null,
+  timezone text not null default 'America/New_York',
+  phone text,
+  email text,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists business_users (
+  id uuid primary key default gen_random_uuid(),
+  business_id uuid not null references businesses(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  role user_role not null default 'owner',
+  created_at timestamptz not null default now(),
+  unique (business_id, user_id)
+);
+
+-- D) Staff & availability
+create table if not exists staff (
+  id uuid primary key default gen_random_uuid(),
+  business_id uuid not null references businesses(id) on delete cascade,
+  name text not null,
+  email text,
+  phone text,
+  color_hex text,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists staff_working_hours (
+  id uuid primary key default gen_random_uuid(),
+  staff_id uuid not null references staff(id) on delete cascade,
+  day_of_week int not null check (day_of_week between 0 and 6), -- 0 Sunday
+  start_time time not null,
+  end_time time not null,
+  unique (staff_id, day_of_week, start_time, end_time)
+);
+
+create table if not exists staff_time_off (
+  id uuid primary key default gen_random_uuid(),
+  staff_id uuid not null references staff(id) on delete cascade,
+  start_ts timestamptz not null,
+  end_ts timestamptz not null,
+  check (end_ts > start_ts)
+);
+
+-- E) Services & mapping
+create table if not exists services (
+  id uuid primary key default gen_random_uuid(),
+  business_id uuid not null references businesses(id) on delete cascade,
+  name text not null,
+  duration_minutes int not null check (duration_minutes > 0),
+  buffer_before_minutes int not null default 0,
+  buffer_after_minutes int not null default 0,
+  price_cents int not null default 0,
+  requires_resource boolean not null default false,
+  allow_deposit boolean not null default false,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists service_staff (
+  service_id uuid not null references services(id) on delete cascade,
+  staff_id uuid not null references staff(id) on delete cascade,
+  primary key (service_id, staff_id)
+);
+
+-- F) Resources (optional in MVP)
+create table if not exists resources (
+  id uuid primary key default gen_random_uuid(),
+  business_id uuid not null references businesses(id) on delete cascade,
+  type text not null,
+  name text not null
+);
+
+-- G) Clients & leads
+create table if not exists clients (
+  id uuid primary key default gen_random_uuid(),
+  business_id uuid not null references businesses(id) on delete cascade,
+  name text,
+  phone text,
+  email text,
+  sms_opt_in boolean not null default true,
+  email_opt_in boolean not null default true,
+  tags jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists clients_biz_phone_idx on clients(business_id, phone);
+create index if not exists clients_biz_email_idx on clients(business_id, email);
+
+create table if not exists leads (
+  id uuid primary key default gen_random_uuid(),
+  business_id uuid not null references businesses(id) on delete cascade,
+  name text,
+  phone text,
+  email text,
+  source lead_source,
+  category lead_category not null default 'cold',
+  score int not null default 0,
+  status lead_status not null default 'open',
+  client_id uuid references clients(id),
+  owner_staff_id uuid references staff(id),
+  tags jsonb not null default '{}'::jsonb,
+  last_activity_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists lead_activity (
+  id uuid primary key default gen_random_uuid(),
+  lead_id uuid not null references leads(id) on delete cascade,
+  type activity_type not null,
+  transcript text,
+  payload jsonb,
+  sentiment sentiment,
+  created_at timestamptz not null default now()
+);
+
+-- H) Appointments
+create table if not exists appointments (
+  id uuid primary key default gen_random_uuid(),
+  business_id uuid not null references businesses(id) on delete cascade,
+  client_id uuid references clients(id),
+  service_id uuid not null references services(id),
+  staff_id uuid not null references staff(id),
+  resource_id uuid references resources(id),
+  start_ts timestamptz not null,
+  end_ts timestamptz not null,
+  status appointment_status not null default 'pending',
+  origin appointment_origin not null default 'web',
+  hold_expires_at timestamptz,           -- used for soft holds
+  stripe_payment_intent text,
+  deposit_cents int not null default 0,
+  policy_snapshot jsonb,
+  notes text,
+  created_at timestamptz not null default now(),
+  -- generated range for overlap checks / indexing
+  time_range tstzrange generated always as (tstzrange(start_ts, end_ts, '[)')) stored
+);
+
+create index if not exists appt_biz_staff_ts_idx on appointments (business_id, staff_id, start_ts);
+create index if not exists appt_time_range_gist on appointments using gist (staff_id, time_range);
+
+-- I) Waitlist & comms
+create table if not exists waitlist (
+  id uuid primary key default gen_random_uuid(),
+  business_id uuid not null references businesses(id) on delete cascade,
+  client_id uuid not null references clients(id) on delete cascade,
+  service_id uuid not null references services(id) on delete cascade,
+  preferred_start_time time,
+  preferred_end_time time,
+  preferred_days int[],
+  priority_score int not null default 0,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists comms (
+  id uuid primary key default gen_random_uuid(),
+  business_id uuid not null references businesses(id) on delete cascade,
+  channel comm_channel not null,
+  to_contact text not null,
+  template_id text,
+  status comm_status not null default 'queued',
+  metadata jsonb,
+  related_type related_type,
+  related_id uuid,
+  created_at timestamptz not null default now()
+);
+
+-- J) Policies & integrations
+create table if not exists policies (
+  id uuid primary key default gen_random_uuid(),
+  business_id uuid unique not null references businesses(id) on delete cascade,
+  cancellation jsonb not null default '{}'::jsonb,
+  deposit jsonb not null default '{}'::jsonb,
+  reminders jsonb not null default '{}'::jsonb,
+  quiet_hours jsonb not null default '{}'::jsonb
+);
+
+create table if not exists integrations (
+  id uuid primary key default gen_random_uuid(),
+  business_id uuid unique not null references businesses(id) on delete cascade,
+  google_calendar jsonb,
+  microsoft_calendar jsonb,
+  stripe jsonb,
+  twilio jsonb,
+  postmark jsonb
+);
+-- One demo business, service, staff, and hours (Mon–Fri 9–5)
+insert into businesses (slug, name, timezone) values ('acme-salon','ACME Salon','America/New_York')
+on conflict (slug) do nothing;
+
+insert into staff (business_id, name) 
+select id, 'Alex Stylist' from businesses where slug='acme-salon'
+on conflict do nothing;
+
+insert into services (business_id, name, duration_minutes, price_cents, buffer_before_minutes, buffer_after_minutes)
+select id, 'Haircut (30m)', 30, 4000, 0, 0 from businesses where slug='acme-salon'
+on conflict do nothing;
+
+insert into service_staff (service_id, staff_id)
+select s.id, st.id from services s
+join businesses b on b.id=s.business_id and b.slug='acme-salon'
+join staff st on st.business_id=b.id
+on conflict do nothing;
+
+-- Working hours: Mon–Fri (1..5) 09:00–17:00 for that staff
+insert into staff_working_hours (staff_id, day_of_week, start_time, end_time)
+select st.id, dow, time '09:00', time '17:00'
+from staff st
+cross join generate_series(1,5) as dow
+join businesses b on b.slug='acme-salon' and st.business_id=b.id
+on conflict do nothing;

@@ -1,0 +1,3 @@
+create index if not exists appt_pending_contact_idx
+on appointments (client_id, start_ts)
+where status = 'pending';

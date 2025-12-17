@@ -1,0 +1,9 @@
+-- A) What did we just create?
+select id, status, hold_expires_at, created_at
+from appointments
+order by created_at desc
+limit 3;
+
+-- B) Try confirming the newest pending manually:
+-- copy the id from A where status='pending'
+select confirm_booking_public('52e6e36d-82d5-46a9-895b-37ceca1ead29');

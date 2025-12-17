@@ -1,0 +1,290 @@
+-- Helper: keep function search_path safe
+create or replace function set_safe_search_path() returns void
+language sql as $$ select set_config('search_path','public',true); $$;
+
+-- Resolve business by slug
+create or replace function get_business_id_by_slug(p_slug text)
+returns uuid
+language sql
+stable
+as $$
+  select id from businesses where slug = p_slug and is_active = true
+$$;
+
+-- List services (public)
+create or replace function list_services_public(p_slug text)
+returns table(id uuid, name text, duration_minutes int, price_cents int)
+language plpgsql
+security definer
+as $$
+begin
+  perform set_safe_search_path();
+  return query
+    select s.id, s.name, s.duration_minutes, s.price_cents
+    from services s
+    where s.business_id = get_business_id_by_slug(p_slug)
+    order by s.name;
+end; $$;
+
+grant execute on function list_services_public(text) to anon, authenticated;
+
+-- List staff for a given service (public)
+create or replace function list_staff_for_service_public(p_slug text, p_service_id uuid)
+returns table(staff_id uuid, staff_name text)
+language plpgsql
+security definer
+as $$
+begin
+  perform set_safe_search_path();
+  return query
+    select st.id, st.name
+    from staff st
+    join service_staff ss on ss.staff_id = st.id
+    where ss.service_id = p_service_id
+      and st.business_id = get_business_id_by_slug(p_slug)
+      and st.is_active = true
+    order by st.name;
+end; $$;
+
+grant execute on function list_staff_for_service_public(text, uuid) to anon, authenticated;
+
+-- Find bookable slots for a given day (business-local date)
+create or replace function get_bookable_slots_public(
+  p_slug text,
+  p_service_id uuid,
+  p_day date,
+  p_granularity_minutes int default 15
+)
+returns table(start_ts timestamptz, staff_id uuid)
+language plpgsql
+security definer
+as $$
+declare
+  v_business_id uuid;
+  v_tz text;
+  v_dur int;
+  v_buf_before int;
+  v_buf_after int;
+  v_total_minutes int;
+begin
+  perform set_safe_search_path();
+  select id, timezone into v_business_id, v_tz
+  from businesses where slug = p_slug and is_active = true;
+
+  if v_business_id is null then
+    raise exception 'Business not found or inactive';
+  end if;
+
+  select duration_minutes, buffer_before_minutes, buffer_after_minutes
+    into v_dur, v_buf_before, v_buf_after
+  from services
+  where id = p_service_id and business_id = v_business_id;
+
+  if v_dur is null then
+    raise exception 'Service not found for this business';
+  end if;
+
+  v_total_minutes := v_dur + coalesce(v_buf_before,0) + coalesce(v_buf_after,0);
+
+  return query
+  with svc_staff as (
+    select st.id as staff_id
+    from staff st
+    join service_staff ss on ss.staff_id = st.id
+    where ss.service_id = p_service_id
+      and st.business_id = v_business_id
+      and st.is_active = true
+  ),
+  hrs as (
+    select
+      s.staff_id,
+      ((p_day::timestamp without time zone + swh.start_time) at time zone v_tz) as win_start,
+      ((p_day::timestamp without time zone + swh.end_time)   at time zone v_tz) as win_end
+    from svc_staff s
+    join staff_working_hours swh on swh.staff_id = s.staff_id
+    where swh.day_of_week = extract(dow from p_day)::int
+  ),
+  candidates as (
+    select
+      h.staff_id,
+      gs as slot_start,
+      (gs + make_interval(mins => v_total_minutes)) as slot_end
+    from hrs h,
+    lateral generate_series(
+      h.win_start,
+      h.win_end - make_interval(mins => v_total_minutes),
+      make_interval(mins => p_granularity_minutes)
+    ) as gs
+  ),
+  valid as (
+    select c.staff_id, c.slot_start
+    from candidates c
+    where not exists (
+      select 1 from staff_time_off toff
+      where toff.staff_id = c.staff_id
+        and tstzrange(toff.start_ts, toff.end_ts, '[)') &&
+            tstzrange(c.slot_start, c.slot_end, '[)')
+    )
+    and not exists (
+      select 1 from appointments a
+      where a.staff_id = c.staff_id
+        and a.business_id = v_business_id
+        and a.status in ('pending','confirmed','reconfirm_pending')
+        and coalesce(a.hold_expires_at, now() + interval '100 years') > now()
+        and a.time_range && tstzrange(c.slot_start, c.slot_end, '[)')
+    )
+  )
+  select v.slot_start, v.staff_id from valid v
+  order by v.slot_start, v.staff_id;
+end; $$;
+
+grant execute on function get_bookable_slots_public(text, uuid, date, int) to anon, authenticated;
+
+-- Reserve (soft-hold) a slot
+create or replace function reserve_slot_public(
+  p_slug text,
+  p_service_id uuid,
+  p_staff_id uuid,
+  p_client_name text,
+  p_client_phone text,
+  p_client_email text,
+  p_start_ts timestamptz,
+  p_hold_minutes int default 15
+)
+returns uuid
+language plpgsql
+security definer
+as $$
+declare
+  v_business_id uuid;
+  v_tz text;
+  v_dur int;
+  v_buf_before int;
+  v_buf_after int;
+  v_total_minutes int;
+  v_end_ts timestamptz;
+  v_client_id uuid;
+  v_appt_id uuid;
+begin
+  perform set_safe_search_path();
+  select id, timezone into v_business_id, v_tz
+  from businesses where slug = p_slug and is_active = true;
+  if v_business_id is null then
+    raise exception 'Business not found or inactive';
+  end if;
+
+  select duration_minutes, buffer_before_minutes, buffer_after_minutes
+    into v_dur, v_buf_before, v_buf_after
+  from services
+  where id = p_service_id and business_id = v_business_id;
+
+  if v_dur is null then
+    raise exception 'Service not found';
+  end if;
+
+  v_total_minutes := v_dur + coalesce(v_buf_before,0) + coalesce(v_buf_after,0);
+  v_end_ts := p_start_ts + make_interval(mins => v_total_minutes);
+
+  -- Validate staff can perform service
+  if not exists (
+    select 1 from service_staff ss
+    join staff st on st.id = ss.staff_id
+    where ss.service_id = p_service_id
+      and ss.staff_id  = p_staff_id
+      and st.business_id = v_business_id
+      and st.is_active = true
+  ) then
+    raise exception 'Staff not eligible for service';
+  end if;
+
+  -- Check conflicts at reservation time
+  if exists (
+    select 1 from appointments a
+    where a.business_id = v_business_id
+      and a.staff_id = p_staff_id
+      and a.status in ('pending','confirmed','reconfirm_pending')
+      and coalesce(a.hold_expires_at, now() + interval '100 years') > now()
+      and a.time_range && tstzrange(p_start_ts, v_end_ts, '[)')
+  ) then
+    raise exception 'Slot no longer available';
+  end if;
+
+  -- Upsert client
+  select id into v_client_id
+  from clients
+  where business_id = v_business_id
+    and ( (p_client_phone is not null and phone = p_client_phone)
+       or (p_client_email is not null and email = p_client_email) )
+  limit 1;
+
+  if v_client_id is null then
+    insert into clients (business_id, name, phone, email)
+    values (v_business_id, p_client_name, p_client_phone, p_client_email)
+    returning id into v_client_id;
+  end if;
+
+  -- Insert pending appointment (hold)
+  insert into appointments (
+    business_id, client_id, service_id, staff_id,
+    start_ts, end_ts, status, origin, hold_expires_at
+  ) values (
+    v_business_id, v_client_id, p_service_id, p_staff_id,
+    p_start_ts, v_end_ts, 'pending', 'web',
+    now() + make_interval(mins => p_hold_minutes)
+  ) returning id into v_appt_id;
+
+  return v_appt_id;
+end; $$;
+
+grant execute on function reserve_slot_public(text, uuid, uuid, text, text, text, timestamptz, int) to anon, authenticated;
+
+-- Confirm a pending (held) appointment
+create or replace function confirm_booking_public(
+  p_appointment_id uuid,
+  p_stripe_payment_intent text default null,
+  p_deposit_cents int default 0
+)
+returns boolean
+language plpgsql
+security definer
+as $$
+declare
+  v_ok boolean := false;
+begin
+  perform set_safe_search_path();
+
+  update appointments a
+  set status = 'confirmed',
+      hold_expires_at = null,
+      stripe_payment_intent = coalesce(p_stripe_payment_intent, stripe_payment_intent),
+      deposit_cents = coalesce(p_deposit_cents, deposit_cents)
+  where a.id = p_appointment_id
+    and a.status = 'pending'
+    and (a.hold_expires_at is null or a.hold_expires_at > now())
+  returning true into v_ok;
+
+  return coalesce(v_ok, false);
+end; $$;
+
+grant execute on function confirm_booking_public(uuid, text, int) to anon, authenticated;
+
+-- Housekeeping: release expired holds (call hourly from n8n)
+create or replace function release_expired_holds()
+returns int
+language plpgsql
+security definer
+as $$
+declare
+  v_count int;
+begin
+  perform set_safe_search_path();
+  update appointments
+    set status = 'cancelled'
+  where status = 'pending'
+    and hold_expires_at is not null
+    and hold_expires_at < now();
+  get diagnostics v_count = row_count;
+  return v_count;
+end; $$;
+
+grant execute on function release_expired_holds() to authenticated;  -- n8n uses service key

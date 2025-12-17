@@ -1,0 +1,35 @@
+do $$
+declare
+  t text;
+begin
+  -- list every table that has a business_id and wasn't explicitly updated yet
+  for t in
+    select unnest(array[
+      'staff_working_hours','staff_time_off','service_staff',
+      'resources','leads','lead_activity',
+      'waitlist','comms','policies','integrations'
+    ])
+  loop
+    execute format('drop policy if exists %I on %I', t || '_select', t);
+    execute format('drop policy if exists %I on %I', t || '_crud', t);
+
+    execute format($p$
+      create policy %I on %I for select
+      to authenticated
+      using (
+        business_id in (select business_id from get_user_businesses())
+      );
+    $p$, t || '_select', t);
+
+    execute format($p$
+      create policy %I on %I for all
+      to authenticated
+      using (
+        business_id in (select business_id from get_user_businesses())
+      )
+      with check (
+        business_id in (select business_id from get_user_businesses())
+      );
+    $p$, t || '_crud', t);
+  end loop;
+end $$;

@@ -1,0 +1,14 @@
+-- Safe, stable, and callable by authenticated users
+create or replace function public.get_user_businesses()
+returns table(user_id uuid, business_id uuid)
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select bu.user_id, bu.business_id
+  from business_users bu
+  where bu.user_id = auth.uid();
+$$;
+
+grant execute on function public.get_user_businesses() to authenticated;

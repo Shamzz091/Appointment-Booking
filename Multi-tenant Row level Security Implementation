@@ -1,0 +1,39 @@
+-- 2a.1 staff_working_hours: add business_id and backfill from staff
+alter table staff_working_hours add column if not exists business_id uuid;
+update staff_working_hours swh
+set business_id = st.business_id
+from staff st
+where swh.staff_id = st.id and swh.business_id is null;
+alter table staff_working_hours alter column business_id set not null;
+alter table staff_working_hours
+  add constraint swh_business_fk foreign key (business_id) references businesses(id) on delete cascade;
+
+-- 2a.2 staff_time_off: add business_id and backfill from staff
+alter table staff_time_off add column if not exists business_id uuid;
+update staff_time_off sto
+set business_id = st.business_id
+from staff st
+where sto.staff_id = st.id and sto.business_id is null;
+alter table staff_time_off alter column business_id set not null;
+alter table staff_time_off
+  add constraint sto_business_fk foreign key (business_id) references businesses(id) on delete cascade;
+
+-- 2a.3 service_staff: add business_id and backfill from services
+alter table service_staff add column if not exists business_id uuid;
+update service_staff ss
+set business_id = s.business_id
+from services s
+where ss.service_id = s.id and ss.business_id is null;
+alter table service_staff alter column business_id set not null;
+alter table service_staff
+  add constraint ss_business_fk foreign key (business_id) references businesses(id) on delete cascade;
+
+-- 2a.4 lead_activity: add business_id and backfill from leads
+alter table lead_activity add column if not exists business_id uuid;
+update lead_activity la
+set business_id = l.business_id
+from leads l
+where la.lead_id = l.id and la.business_id is null;
+alter table lead_activity alter column business_id set not null;
+alter table lead_activity
+  add constraint la_business_fk foreign key (business_id) references businesses(id) on delete cascade;

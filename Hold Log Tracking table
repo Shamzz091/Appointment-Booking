@@ -1,0 +1,7 @@
+-- lightweight log for holds to help you detect abuse later
+create table if not exists public.hold_log (
+  id uuid primary key default gen_random_uuid(),
+  appointment_id uuid references appointments(id) on delete cascade,
+  contact_hash text, -- hash(phone/email) from frontend (don’t store raw here)
+  created_at timestamptz default now()
+);

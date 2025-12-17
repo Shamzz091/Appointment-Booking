@@ -1,0 +1,200 @@
+-- =========================================================
+-- Helpers
+-- =========================================================
+
+-- Keep search_path safe
+create or replace function public.set_safe_search_path() returns void
+language sql
+as $$ select set_config('search_path','public',true); $$;
+
+-- Map current user -> business (you already have this; keep if exists)
+create or replace function public.get_user_businesses()
+returns table(user_id uuid, business_id uuid)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select bu.user_id, bu.business_id
+  from public.business_users bu
+  where bu.user_id = auth.uid();
+$$;
+
+revoke all on function public.get_user_businesses() from public;
+grant execute on function public.get_user_businesses() to authenticated;
+
+-- Ensure a policies row exists for the caller's business
+create or replace function public.ensure_policies_row()
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_bid uuid;
+  v_id  uuid;
+begin
+  perform set_safe_search_path();
+
+  select business_id into v_bid
+  from public.get_user_businesses()
+  limit 1;
+
+  if v_bid is null then
+    raise exception 'No business associated with this user';
+  end if;
+
+  -- Create a row if missing
+  insert into public.policies (business_id, cancellation, deposit, reminders, quiet_hours)
+  values (v_bid, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb)
+  on conflict (business_id) do nothing;
+
+  select id into v_id from public.policies where business_id = v_bid limit 1;
+  return v_id;
+end
+$$;
+
+revoke all on function public.ensure_policies_row() from public;
+grant execute on function public.ensure_policies_row() to authenticated;
+
+-- =========================================================
+-- GET: fetch policies for the caller's business
+-- =========================================================
+create or replace function public.get_business_policies()
+returns table(
+  cancellation jsonb,
+  deposit jsonb,
+  reminders jsonb,
+  quiet_hours jsonb
+)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_bid uuid;
+begin
+  perform set_safe_search_path();
+
+  select business_id into v_bid
+  from public.get_user_businesses()
+  limit 1;
+
+  if v_bid is null then
+    raise exception 'No business associated with this user';
+  end if;
+
+  -- ensure row exists so UI can always read something
+  perform public.ensure_policies_row();
+
+  return query
+  select p.cancellation, p.deposit, p.reminders, p.quiet_hours
+  from public.policies p
+  where p.business_id = v_bid
+  limit 1;
+end
+$$;
+
+revoke all on function public.get_business_policies() from public;
+grant execute on function public.get_business_policies() to authenticated;
+
+-- =========================================================
+-- UPSERT (single section): cancellation / deposit / reminders / quiet_hours
+-- =========================================================
+create or replace function public.upsert_policy_section(
+  p_section text,   -- 'cancellation' | 'deposit' | 'reminders' | 'quiet_hours'
+  p_value   jsonb
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_bid uuid;
+  v_rows int := 0;
+begin
+  perform set_safe_search_path();
+
+  select business_id into v_bid
+  from public.get_user_businesses()
+  limit 1;
+
+  if v_bid is null then
+    raise exception 'No business associated with this user';
+  end if;
+
+  -- make sure a row exists
+  perform public.ensure_policies_row();
+
+  if p_section = 'cancellation' then
+    update public.policies set cancellation = coalesce(p_value, '{}'::jsonb)
+    where business_id = v_bid;  get diagnostics v_rows = row_count;
+
+  elsif p_section = 'deposit' then
+    update public.policies set deposit = coalesce(p_value, '{}'::jsonb)
+    where business_id = v_bid;  get diagnostics v_rows = row_count;
+
+  elsif p_section = 'reminders' then
+    update public.policies set reminders = coalesce(p_value, '{}'::jsonb)
+    where business_id = v_bid;  get diagnostics v_rows = row_count;
+
+  elsif p_section = 'quiet_hours' then
+    update public.policies set quiet_hours = coalesce(p_value, '{}'::jsonb)
+    where business_id = v_bid;  get diagnostics v_rows = row_count;
+
+  else
+    raise exception 'Invalid policy section: % (allowed: cancellation, deposit, reminders, quiet_hours)', p_section;
+  end if;
+
+  return v_rows = 1;
+end
+$$;
+
+revoke all on function public.upsert_policy_section(text, jsonb) from public;
+grant execute on function public.upsert_policy_section(text, jsonb) to authenticated;
+
+-- =========================================================
+-- UPSERT (batch): update multiple sections at once (only params you pass)
+-- =========================================================
+create or replace function public.upsert_policies(
+  p_cancellation jsonb default null,
+  p_deposit      jsonb default null,
+  p_reminders    jsonb default null,
+  p_quiet_hours  jsonb default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_bid uuid;
+  v_rows int := 0;
+begin
+  perform set_safe_search_path();
+
+  select business_id into v_bid
+  from public.get_user_businesses()
+  limit 1;
+
+  if v_bid is null then
+    raise exception 'No business associated with this user';
+  end if;
+
+  perform public.ensure_policies_row();
+
+  update public.policies p
+  set cancellation = coalesce(p_cancellation, p.cancellation),
+      deposit      = coalesce(p_deposit,      p.deposit),
+      reminders    = coalesce(p_reminders,    p.reminders),
+      quiet_hours  = coalesce(p_quiet_hours,  p.quiet_hours)
+  where p.business_id = v_bid;
+
+  get diagnostics v_rows = row_count;
+  return v_rows = 1;
+end
+$$;
+
+revoke all on function public.upsert_policies(jsonb, jsonb, jsonb, jsonb) from public;
+grant execute on function public.upsert_policies(jsonb, jsonb, jsonb, jsonb) to authenticated;

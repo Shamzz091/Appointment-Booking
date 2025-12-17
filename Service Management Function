@@ -1,0 +1,70 @@
+-- Add is_active column to services table
+ALTER TABLE services 
+ADD COLUMN is_active boolean NOT NULL DEFAULT true;
+
+create or replace function public.upsert_service(
+  p_id uuid,
+  p_name text,
+  p_duration_minutes int,
+  p_price_cents int,
+  p_buffer_before int default 0,
+  p_buffer_after int default 0
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_bid uuid;
+  v_id uuid;
+begin
+  perform set_safe_search_path();
+
+  select business_id into v_bid
+  from get_user_businesses()
+  limit 1;
+
+  if v_bid is null then
+    raise exception 'No business found for user';
+  end if;
+
+  if p_id is null then
+    insert into services (
+      business_id, name, duration_minutes, price_cents,
+      buffer_before_minutes, buffer_after_minutes, is_active
+    ) values (
+      v_bid, trim(p_name), p_duration_minutes, p_price_cents,
+      p_buffer_before, p_buffer_after, true
+    ) returning id into v_id;
+  else
+    update services
+       set name = trim(p_name),
+           duration_minutes = p_duration_minutes,
+           price_cents = p_price_cents,
+           buffer_before_minutes = p_buffer_before,
+           buffer_after_minutes = p_buffer_after
+     where id = p_id and business_id = v_bid
+     returning id into v_id;
+  end if;
+
+  return v_id;
+end $$;
+
+grant execute on function public.upsert_service(uuid,text,int,int,int,int) to authenticated;
+
+create or replace function public.soft_delete_service(p_id uuid)
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+  update services
+     set is_active = false
+   where id = p_id
+     and business_id in (select business_id from get_user_businesses())
+  returning true;
+$$;
+
+grant execute on function public.soft_delete_service(uuid) to authenticated;
+
